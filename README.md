@@ -38,6 +38,7 @@ MP3 backend you almost certainly already have.
 - [Troubleshooting](#troubleshooting)
 - [Uninstall](#uninstall)
 - [Roadmap](#roadmap)
+- [License](#license)
 
 ---
 
@@ -258,6 +259,7 @@ Ctrl-C — so no zombie decoders and no garbled terminals, ever.
 sonic/
 ├── sonic.py          # the entire player (executable, #!/usr/bin/env python3)
 ├── requirements.txt  # tinytag — optional ID3 support
+├── LICENSE           # MIT
 └── README.md         # you are here
 ```
 
@@ -300,3 +302,9 @@ Ideas, roughly in order of likelihood:
 - [ ] Packaging: AUR / PyPI entry point
 
 PRs welcome — it's one file, the bar is low. 🙂
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
