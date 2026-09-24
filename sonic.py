@@ -8,9 +8,8 @@ Requires: mpg123 on PATH. Optional: tinytag (for ID3 title/artist display).
 """
 
 import argparse
-import array
 import curses
-import math
+import io
 import os
 import random
 import re
@@ -19,7 +18,6 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass, field
 
 VERSION = "0.2.0"
@@ -27,11 +25,6 @@ VERSION = "0.2.0"
 SEEK_STEP = 5          # seconds per left/right press
 VOLUME_STEP = 5        # percent per +/- press
 POLL_INTERVAL = 0.05   # UI tick, seconds
-
-# Visualizer defaults
-SAMPLE_RATE = 16000    # Hz, mono, used by the analysis-only decoder
-FFT_WINDOW = 1024      # samples per spectrum frame
-BARS_MAX = 32          # max spectrum bars in the side panel
 
 # Album art
 IMAGE_EXTS = (".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".gif",
@@ -45,14 +38,6 @@ try:
     HAVE_TINYTAG = True
 except ImportError:  # degrade gracefully to filenames
     HAVE_TINYTAG = False
-
-try:
-    import numpy as _np
-
-    HAVE_NUMPY = True
-except ImportError:  # pure-python Goertzel fallback
-    _np = None
-    HAVE_NUMPY = False
 
 try:
     from PIL import Image as _PILImage
@@ -130,55 +115,10 @@ def progress_bar(frac: float, width: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# Spectrum analysis (pure helpers, testable)
+# Album art (folder-based + embedded)
 # --------------------------------------------------------------------------
 
-def band_frequencies(rate: int, bars: int, fmin: float = 30.0) -> list:
-    """Log-spaced center frequencies for `bars` spectrum bars."""
-    fmax = min(rate / 2 - 1, 8000.0)
-    if bars <= 1:
-        return [math.sqrt(fmin * fmax)]
-    ratio = (fmax / fmin) ** (1 / (bars - 1))
-    return [fmin * ratio ** i for i in range(bars)]
-
-
-def goertzel(samples: list, freq: float, rate: int) -> float:
-    """Single-bin magnitude via Goertzel's algorithm (pure-Python FFT fallback)."""
-    if not samples:
-        return 0.0
-    coeff = 2 * math.cos(2 * math.pi * freq / rate)
-    s1 = s2 = 0.0
-    for x in samples:
-        s0 = x + coeff * s1 - s2
-        s2, s1 = s1, s0
-    return math.sqrt(max(0.0, s1 * s1 + s2 * s2 - coeff * s1 * s2))
-
-
-def spectrum_magnitudes(samples: list, rate: int, bars: int) -> list:
-    """Magnitude per log band for a window of samples."""
-    if bars <= 0 or len(samples) < 2:
-        return [0.0] * bars
-    if HAVE_NUMPY:
-        n = len(samples)
-        freq = _np.fft.rfftfreq(n, d=1 / rate)
-        mag = _np.abs(_np.fft.rfft(_np.asarray(samples, dtype=_np.float64)))
-        edges = _np.geomspace(max(30.0, freq[1] if len(freq) > 1 else 30.0),
-                              min(rate / 2 - 1, 8000.0), bars + 1)
-        out = []
-        for i in range(bars):
-            mask = (freq >= edges[i]) & (freq < edges[i + 1])
-            vals = mag[mask]
-            out.append(float(vals.mean()) if vals.size else 0.0)
-        return out
-    out = []
-    for f in band_frequencies(rate, bars):
-        out.append(goertzel(samples, f, rate))
-    return out
-
-
-# --------------------------------------------------------------------------
-# Album art (folder-based)
-# --------------------------------------------------------------------------
+EMBEDDED_CHOICE = "__embedded__"
 
 def scan_album_art(directory: str) -> list:
     """Image files directly inside `directory`, ignoring subfolders."""
@@ -227,6 +167,74 @@ def find_cover(track_path: str, image_names: list) -> str | None:
     return images[0]
 
 
+def get_embedded_image(track_path: str) -> bytes | None:
+    """Return embedded cover bytes for a track, or None.
+
+    Uses tinytag (`images.any.data`, with a `get_image()` fallback).
+    One file read per call; callers should only invoke it on demand
+    (track change / picker open), never per UI tick.
+    """
+    if not HAVE_TINYTAG:
+        return None
+    try:
+        tag = TinyTag.get(track_path, image=True)
+    except Exception:
+        return None
+    try:
+        images = getattr(tag, "images", None)
+        if images is not None:
+            for attr in ("any", "front_cover", "back_cover", "other", "media"):
+                try:
+                    img = getattr(images, attr, None)
+                except Exception:
+                    continue
+                if img is None:
+                    continue
+                if isinstance(img, bytes) and img:
+                    return img
+                data = getattr(img, "data", None)
+                if isinstance(data, bytes) and data:
+                    return data
+                if isinstance(img, (list, tuple)):
+                    for item in img:
+                        if isinstance(item, bytes) and item:
+                            return item
+                        d = getattr(item, "data", None)
+                        if isinstance(d, bytes) and d:
+                            return d
+        get_image = getattr(tag, "get_image", None)
+        if callable(get_image):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    data = get_image()
+                except Exception:
+                    data = None
+            if isinstance(data, bytes) and data:
+                return data
+    except Exception:
+        return None
+    return None
+
+
+def build_art_choices(image_names: list, has_embedded: bool) -> list:
+    """Selectable album-art entries: sorted folder images + embedded opt-in."""
+    choices = sorted(
+        n for n in (image_names or [])
+        if os.path.splitext(n)[1].lower() in IMAGE_EXTS
+    )
+    if has_embedded:
+        choices.append(EMBEDDED_CHOICE)
+    return choices
+
+
+def choice_label(choice: str) -> str:
+    if choice == EMBEDDED_CHOICE:
+        return "Embedded cover (from MP3 tags)"
+    return choice
+
+
 _ASCII_RAMP = " .:-=+*#%@"
 _BASE16_RGB = {
     0: (0, 0, 0), 1: (128, 0, 0), 2: (0, 128, 0), 3: (128, 128, 0),
@@ -246,25 +254,62 @@ def terminal_palette(ncolors: int) -> list:
 
 
 class CoverArt:
-    """Resolves + renders the current track's cover to a cell grid."""
+    """Renders the user-selected cover (folder image or embedded bytes).
+
+    Nothing is auto-selected: `manual` is only set via the art picker
+    (key `a`). Per-track `set_track` then resolves that choice --
+    a filename stays constant, `EMBEDDED_CHOICE` reloads each track's tags.
+    """
 
     def __init__(self, directory: str, image_names: list):
         self.directory = directory
-        self.image_names = image_names
+        self.image_names = list(image_names)
+        self.manual: str | None = None
         self.path: str | None = None
+        self._embedded: bytes | None = None
         self._cache: dict = {}
-        self.available = bool(HAVE_PIL and image_names)
+        self.available = bool(HAVE_PIL)
+
+    def set_manual(self, choice: str | None) -> None:
+        self.manual = choice
+        self.path = None
+        self._embedded = None
+        self._cache.clear()
+
+    def refresh_images(self, image_names: list) -> None:
+        self.image_names = list(image_names)
+        if self.manual not in (None, EMBEDDED_CHOICE) and self.manual not in self.image_names:
+            self.set_manual(None)
 
     def set_track(self, track_path: str) -> None:
+        if self.manual == EMBEDDED_CHOICE:
+            data = get_embedded_image(track_path)
+            if data != self._embedded:
+                self._cache.clear()
+            self._embedded = data
+            self.path = None
+            return
+        if self.manual:
+            path = os.path.join(self.directory, self.manual)
+            if path != self.path:
+                self._cache.clear()
+            self.path = path if os.path.isfile(path) else None
+            self._embedded = None
+            return
+        # No manual choice: fall back to the auto best-guess so art still
+        # works if a caller never opened the picker.
         name = find_cover(track_path, self.image_names)
         path = os.path.join(self.directory, name) if name else None
         if path != self.path:
-            self.path = path
             self._cache.clear()
+        self.path = path
+        self._embedded = None
 
     def render(self, cols: int, rows: int, use_color: bool, ncolors: int):
         """Return rows of (color_index|None, char) cells, or None if no art."""
-        if self.path is None or not self.available:
+        if not self.available:
+            return None
+        if self.path is None and self._embedded is None:
             return None
         key = (cols, rows, use_color, ncolors)
         if key not in self._cache:
@@ -283,7 +328,10 @@ class CoverArt:
     def _render(self, cols: int, rows: int, use_color: bool, ncolors: int) -> list | None:
         palette = terminal_palette(ncolors)
         try:
-            img = _PILImage.open(self.path)
+            if self._embedded is not None:
+                img = _PILImage.open(io.BytesIO(self._embedded))
+            else:
+                img = _PILImage.open(self.path)
             img = _PILImageOps.exif_transpose(img).convert("RGB")
             img.thumbnail((max(1, cols), max(1, rows)), _PILImage.Resampling.LANCZOS)
         except Exception:
@@ -432,150 +480,6 @@ class Engine:
 
 
 # --------------------------------------------------------------------------
-# PCM analyzer (Cava-style visualizer feed)
-# --------------------------------------------------------------------------
-
-class PCMAnalyzer:
-    """Decodes the current track to raw PCM on stdout for spectrum analysis.
-
-    A second, analysis-only `mpg123 -R -s` process mirrors the playback
-    engine's commands. mpg123 sends control responses to stderr when -s is
-    active, leaving stdout clean for binary samples.
-    """
-
-    def __init__(self, enabled: bool = True):
-        self.proc = None
-        self.enabled = bool(enabled)
-        self.bars = BARS_MAX
-        self.active = False
-        self.levels = [0.0] * self.bars
-        self._buf = b""
-        self._ctl = b""
-        self._samples = deque(maxlen=FFT_WINDOW)
-        self._peak = 1.0
-        if self.enabled:
-            try:
-                self.proc = subprocess.Popen(
-                    ["mpg123", "--remote", "--stdout", "--quiet",
-                     "--mono", "--rate", str(SAMPLE_RATE)],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                os.set_blocking(self.proc.stdout.fileno(), False)
-                os.set_blocking(self.proc.stderr.fileno(), False)
-            except OSError:
-                self.proc = None
-
-    def _send(self, cmd: str) -> None:
-        if self.proc is None:
-            return
-        try:
-            self.proc.stdin.write(cmd.encode() + b"\n")
-            self.proc.stdin.flush()
-        except (BrokenPipeError, ValueError):
-            self.proc = None
-
-    def _reset_audio(self) -> None:
-        self._buf = b""
-        self._samples.clear()
-        self._peak = 1.0
-        self.levels = [0.0] * self.bars
-
-    def load(self, path: str) -> None:
-        self.active = True
-        self._reset_audio()
-        self._send(f"LOAD {path}")
-
-    def pause_toggle(self) -> None:
-        if self.active is False and self.proc is not None:
-            self.active = True
-        self._send("PAUSE")
-
-    def stop(self) -> None:
-        self.active = False
-        self._reset_audio()
-        self._send("STOP")
-
-    def seek(self, delta_seconds: int) -> None:
-        if not self.active or self.proc is None:
-            return
-        sign = "+" if delta_seconds >= 0 else "-"
-        self._reset_audio()
-        self._send(f"JUMP {sign}{abs(delta_seconds)}s")
-
-    def poll(self) -> None:
-        if self.proc is None:
-            return
-        if self.proc.poll() is not None:
-            self.active = False
-            return
-        fd_err, fd_out = self.proc.stderr.fileno(), self.proc.stdout.fileno()
-        while True:
-            ready, _, _ = select.select([fd_err], [], [], 0)
-            if not ready:
-                break
-            try:
-                chunk = os.read(fd_err, 4096)
-            except (OSError, ValueError):
-                break
-            if not chunk:
-                break
-            self._ctl += chunk  # control lines; position is driven by Engine
-        if self.active:
-            while True:
-                ready, _, _ = select.select([fd_out], [], [], 0)
-                if not ready:
-                    break
-                try:
-                    chunk = os.read(fd_out, 4096)
-                except (OSError, ValueError):
-                    self.active = False
-                    break
-                if not chunk:
-                    self.active = False
-                    break
-                self._buf += chunk
-            self._consume()
-            if len(self._samples) >= FFT_WINDOW:
-                self._update_levels()
-
-    def _consume(self) -> None:
-        n = len(self._buf) // 2
-        if n == 0:
-            return
-        arr = array.array("h")
-        arr.frombytes(self._buf[:n * 2])
-        self._buf = self._buf[n * 2:]
-        self._samples.extend(arr)
-
-    def _update_levels(self) -> None:
-        mags = spectrum_magnitudes(list(self._samples), SAMPLE_RATE, self.bars)
-        new = []
-        for m in mags:
-            self._peak = max(self._peak, m)
-            db = 20 * math.log10(max(m, 1e-9) / max(self._peak, 1e-9))
-            lvl = min(1.0, max(0.0, (db + 40.0) / 40.0))
-            new.append(lvl)
-        self._peak *= 0.9995  # slow decay so bars track the loudest part
-        self.levels = [
-            nxt if nxt >= old else max(0.0, old * 0.85)
-            for old, nxt in zip(self.levels, new)
-        ]
-
-    def quit(self) -> None:
-        if self.proc is None:
-            return
-        try:
-            self._send("QUIT")
-        finally:
-            try:
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-
-
-# --------------------------------------------------------------------------
 # Queue logic (pure, UI-independent)
 # --------------------------------------------------------------------------
 
@@ -651,39 +555,24 @@ class Queue:
 # --------------------------------------------------------------------------
 
 KEY_HINTS = ("↑↓/jk select · Enter play · Space pause · n/p next/prev · "
-             "←/→ seek · +/- vol · s shuffle · r repeat · a art · v viz · q quit")
+             "←/→ seek · +/- vol · s shuffle · r repeat · a art · q quit")
 
 REPEAT_LABEL = {"off": "off", "all": "all", "one": "one"}
 
-BAR_CHARS = " ▁▂▃▄▅▆▇█"
 
-
-def compute_layout(h: int, w: int, art_on: bool, viz_on: bool) -> dict:
+def compute_layout(h: int, w: int, art_on: bool) -> dict:
     """Pure layout logic; returns panel/list geometry for a terminal size."""
     layout = {
-        "panel_w": 0, "list_w": max(0, w - 1), "art_h": 0, "viz_h": 0,
+        "panel_w": 0, "list_w": max(0, w - 1), "art_h": 0,
     }
-    if (art_on or viz_on) and h >= 14 and w >= 76 and h - 5 >= 7:
+    if art_on and h >= 14 and w >= 76 and h - 5 >= 7:
         panel_w = max(24, min(40, w // 3))
         list_w = w - 1 - panel_w
         if list_w >= 26:
             layout["panel_w"] = panel_w
             layout["list_w"] = list_w
     if layout["panel_w"]:
-        avail = h - 5
-        if art_on and viz_on:
-            if avail >= 12:
-                art_h = max(5, round(avail * 0.55))
-            else:
-                art_h = max(3, avail - 4)
-            viz_h = avail - art_h
-            if viz_h < 3:
-                art_h, viz_h = avail - 3, 3
-            layout["art_h"], layout["viz_h"] = art_h, viz_h
-        elif art_on:
-            layout["art_h"], layout["viz_h"] = avail, 0
-        else:
-            layout["art_h"], layout["viz_h"] = 0, avail - 1 or 1
+        layout["art_h"] = h - 5
     return layout
 
 
@@ -707,19 +596,17 @@ def _draw_run(s, y, x, cells, color_pairs) -> int:
 
 class UI:
     def __init__(self, stdscr, tracks: list, directory: str,
-                 engine=None, analyzer=None):
+                 engine=None):
         self.stdscr = stdscr
         self.tracks = tracks
         self.directory = directory
         self.queue = Queue(len(tracks))
         self.engine = engine if engine is not None else Engine()
-        self.analyzer = analyzer if analyzer is not None else PCMAnalyzer()
         self.cursor = 0
         self.top = 0  # first visible track row
         self.volume = 70.0
         self.playing: int | None = None
-        self.art_on = True
-        self.viz_on = True
+        self.art_on = False  # opt-in: press `a` to pick art, nothing auto-shown
         self.images = scan_album_art(directory)
         self.cover = CoverArt(directory, self.images)
         self.message = "" if HAVE_TINYTAG else "tinytag missing: showing filenames"
@@ -729,7 +616,6 @@ class UI:
     def play(self, i: int) -> None:
         self.queue.play_index(i)
         self.engine.load(self.tracks[i].path)
-        self.analyzer.load(self.tracks[i].path)
         self.cover.set_track(self.tracks[i].path)
         self.playing = i
 
@@ -739,21 +625,17 @@ class UI:
                 self.play(self.cursor)
         else:
             self.engine.pause_toggle()
-            self.analyzer.pause_toggle()
 
     def seek(self, delta: int) -> None:
         self.engine.seek(delta)
-        self.analyzer.seek(delta)
 
     def step(self, direction: int) -> None:
         nxt = self.queue.advance(direction)
         if nxt is None:
             self.engine.stop()
-            self.analyzer.stop()
             self.playing = None
         else:
             self.engine.load(self.tracks[nxt].path)
-            self.analyzer.load(self.tracks[nxt].path)
             self.cover.set_track(self.tracks[nxt].path)
             self.playing = nxt
 
@@ -761,7 +643,6 @@ class UI:
         self.engine.ended = False
         if self.queue.repeat == "one" and self.playing is not None:
             self.engine.load(self.tracks[self.playing].path)
-            self.analyzer.load(self.tracks[self.playing].path)
         else:
             self.step(+1)
 
@@ -779,7 +660,7 @@ class UI:
         header = f" sonic  ·  {self.directory} "
         s.addstr(0, 0, header[:w - 1], curses.A_BOLD | self._color(1))
 
-        layout = compute_layout(h, w, self.art_on, self.viz_on)
+        layout = compute_layout(h, w, self.art_on)
         list_w = layout["list_w"]
         list_h = h - 5
         panel_w = layout["panel_w"]
@@ -824,9 +705,8 @@ class UI:
         status = (f" vol {int(self.volume)}%  "
                   f"[shuffle {'on' if self.queue.shuffle else 'off'}]  "
                   f"[repeat {REPEAT_LABEL[self.queue.repeat]}]  "
-                  f"[art {'on' if self.art_on else 'off'}]  "
-                  f"[viz {'on' if self.viz_on else 'off'}]")
-        if not panel_w and (self.art_on or self.viz_on):
+                  f"[art {'on' if self.art_on else 'off'}]")
+        if not panel_w and self.art_on:
             status += "  ·  panel hidden: terminal too small"
         if self.message:
             status += f"  ·  {self.message}"
@@ -835,11 +715,15 @@ class UI:
         s.refresh()
 
     def _cover_label(self) -> str:
-        if self.art_on and self.cover.path:
-            return f"[◉ {os.path.basename(self.cover.path)}]" if self.cover.available else "[art: Pillow missing]"
-        if self.art_on:
-            return "[no cover]"
-        return "[art off]"
+        if not self.art_on:
+            return "[art off]"
+        if not self.cover.available:
+            return "[art: Pillow missing]"
+        if self.cover.manual == EMBEDDED_CHOICE:
+            return "[◉ embedded cover]" if self.cover._embedded is not None else "[no embedded cover]"
+        if self.cover.path:
+            return f"[◉ {os.path.basename(self.cover.path)}]"
+        return "[no cover]"
 
     def _draw_panel(self, h: int, w: int, layout: dict, use_color: bool) -> None:
         s = self.stdscr
@@ -852,26 +736,24 @@ class UI:
 
         art_x = panel_x + 2
         art_w = max(1, panel_w - 3)
-        viz_x = panel_x + 1
-        viz_w = max(1, panel_w - 2)
 
         if layout["art_h"] and self.art_on:
             art_y = 1
             cells = self.cover.render(art_w, layout["art_h"], use_color, ncolors)
             if cells is None:
-                msg = "no album art"
-                s.addstr(art_y, art_x, msg[:art_w],
-                         curses.A_DIM if use_color else curses.A_DIM)
+                if not self.cover.available:
+                    msg = "install Pillow for art"
+                elif self.cover.manual == EMBEDDED_CHOICE:
+                    msg = "no embedded cover"
+                else:
+                    msg = "no album art"
+                s.addstr(art_y, art_x, msg[:art_w], curses.A_DIM)
             else:
                 pair_map = {}
                 if use_color:
                     pair_map = self._palette_pairs(ncolors)
                 for i, row in enumerate(cells[:layout["art_h"]]):
                     _draw_run(s, art_y + i, art_x, row, pair_map)
-
-        if layout["viz_h"] and self.viz_on:
-            viz_y = 1 + layout["art_h"] if self.art_on else 1
-            self._draw_bars(viz_y, viz_x, viz_w, layout["viz_h"], use_color)
 
     def _palette_pairs(self, ncolors: int) -> dict:
         if not hasattr(self, "__palette"):
@@ -881,37 +763,91 @@ class UI:
                     self.__palette[idx] = curses.color_pair(idx + 1)
         return self.__palette
 
-    def _draw_bars(self, y: int, x: int, width: int, height: int, use_color: bool) -> None:
-        s = self.stdscr
-        nbars = max(1, min(BARS_MAX, width))
-        self.analyzer.bars = nbars
-        levels = self.analyzer.levels
-        if len(levels) != nbars:
-            levels = [0.0] * nbars
-        green, yellow, red = 2, 3, 4
-        for b in range(nbars):
-            lvl = levels[b] if b < len(levels) else 0.0
-            frac = lvl * height
-            for r in range(height):
-                from_bottom = height - 1 - r
-                ch_frac = frac - from_bottom
-                if ch_frac <= 0:
-                    ch = " "
-                elif ch_frac >= 1:
-                    ch = "█"
-                else:
-                    ch = BAR_CHARS[min(8, int(ch_frac * 8))]
-                attr = curses.A_NORMAL
-                if ch != " " and use_color:
-                    pair = green if from_bottom < height * 0.55 else \
-                           (yellow if from_bottom < height * 0.8 else red)
-                    attr = self._color(pair)
-                elif ch != " ":
-                    attr = curses.A_BOLD
-                s.addstr(y + r, x + b, ch, attr)
-
     def _color(self, n: int) -> int:
         return curses.color_pair(n) if curses.has_colors() else curses.A_NORMAL
+
+    # -- art picker -----------------------------------------------------
+    def _ref_track_path(self) -> str | None:
+        if self.playing is not None and 0 <= self.playing < len(self.tracks):
+            return self.tracks[self.playing].path
+        if 0 <= self.cursor < len(self.tracks):
+            return self.tracks[self.cursor].path
+        return None
+
+    def _enable_art_via_picker(self) -> None:
+        """Turn art on after the user picks which image to use."""
+        if not HAVE_PIL:
+            self.message = "art: install Pillow for album art (pip install Pillow)"
+            return
+        self.images = scan_album_art(self.directory)
+        self.cover.refresh_images(self.images)
+        ref = self._ref_track_path()
+        has_embedded = get_embedded_image(ref) is not None if ref else False
+        choices = build_art_choices(self.images, has_embedded)
+        if not choices:
+            self.message = "no album art found (no images, no embedded cover)"
+            return
+        initial = 0
+        if self.cover.manual in choices:
+            initial = choices.index(self.cover.manual)
+        elif ref:
+            auto = find_cover(ref, self.images)
+            if auto in choices:
+                initial = choices.index(auto)
+            elif has_embedded:
+                initial = choices.index(EMBEDDED_CHOICE)
+        sel = self._prompt_choice(choices, initial)
+        if sel is None:
+            return  # cancelled: stay off
+        self.cover.set_manual(sel)
+        if ref:
+            self.cover.set_track(ref)
+        elif self.playing is not None:
+            self.cover.set_track(self.tracks[self.playing].path)
+        self.art_on = True
+        self.message = ""
+
+    def _prompt_choice(self, choices: list, initial: int = 0) -> str | None:
+        """Modal picker: ↑↓/jk + Enter to choose, Esc/q to cancel."""
+        s = self.stdscr
+        idx = max(0, min(initial, len(choices) - 1))
+        while True:
+            h, w = s.getmaxyx()
+            s.erase()
+            title = " Select album art  (Enter: use · Esc: cancel) "
+            s.addstr(0, 0, title[:w - 1], curses.A_BOLD | self._color(1))
+            max_rows = max(1, h - 3)
+            if idx < 0:
+                idx = 0
+            if idx >= len(choices):
+                idx = len(choices) - 1
+            top = max(0, min(idx - max_rows // 2, max(0, len(choices) - max_rows)))
+            for row in range(min(max_rows, len(choices) - top)):
+                i = top + row
+                label = f" {choice_label(choices[i])}"
+                attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+                try:
+                    s.addstr(1 + row, 0, label[:w - 1], attr)
+                except curses.error:
+                    pass
+            hint = "↑↓/jk move · Enter select · Esc cancel"
+            try:
+                s.addstr(h - 1, 0, hint[:w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+            s.refresh()
+            try:
+                key = s.getch()
+            except curses.error:
+                key = -1
+            if key in (curses.KEY_UP, ord("k")):
+                idx = max(0, idx - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                idx = min(len(choices) - 1, idx + 1)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                return choices[idx]
+            elif key in (27, ord("q")):
+                return None
 
     # -- main loop ------------------------------------------------------
     def run(self) -> None:
@@ -935,7 +871,6 @@ class UI:
             self.engine.poll()
             if self.engine.ended:
                 self.on_track_end()
-            self.analyzer.poll()
             self.draw()
             try:
                 key = s.getch()
@@ -982,9 +917,10 @@ class UI:
         elif key == ord("r"):
             self.queue.cycle_repeat()
         elif key == ord("a"):
-            self.art_on = not self.art_on
-        elif key == ord("v"):
-            self.viz_on = not self.viz_on
+            if self.art_on:
+                self.art_on = False
+            else:
+                self._enable_art_via_picker()
         elif key in (ord("q"), 27):  # q or Esc
             return False
         return True
@@ -996,7 +932,6 @@ def run_ui(stdscr, tracks: list, directory: str) -> None:
         ui.run()
     finally:
         ui.engine.quit()
-        ui.analyzer.quit()
 
 
 # --------------------------------------------------------------------------

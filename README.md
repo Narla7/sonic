@@ -60,6 +60,11 @@ cd ~/Music && sonic
 - 🧹 **No orphans, no mess** — quitting (`q` / `Esc` / Ctrl-C) always sends
   `QUIT` to the decoder (with a `kill` fallback after 2 s) and restores your
   terminal via `curses.wrapper`. Nothing is ever written to disk.
+- 🖼️ **Album art (opt-in)** — off by default, nothing auto-shown on
+  startup. Press `a` to open a picker listing every image in the folder
+  plus `Embedded cover (from MP3 tags)` when the current track has one;
+  `Enter` selects, `Esc` cancels. The file choice sticks for the session,
+  the embedded choice reloads per track. Requires `Pillow`.
 - 🎨 **Color** — cyan header, green now-playing row, yellow progress bar when
   the terminal supports color (degraded to bold/dim otherwise).
 
@@ -90,6 +95,7 @@ Rendered screen (layout follows `UI.draw`; track data is illustrative):
 | Python | ✅ yes | **3.10+** | code uses `X \| None` union annotations | `python3 --version` |
 | `mpg123` (native binary) | ✅ yes | any recent | decodes MPEG audio, talks to ALSA/PulseAudio/PipeWire, drives the seek bar via `--remote` | `which mpg123` |
 | `tinytag` (Python lib) | ❌ optional | ≥ 1.10 (per `requirements.txt`) | ID3 `artist`/`title`/`duration` display; graceful filename fallback when absent | `python3 -c "import tinytag"` |
+| `Pillow` (Python lib) | ✅ yes | ≥ 10 (per `requirements.txt`) | album-art rendering; without it the picker refuses with `art: install Pillow for album art` | `python3 -c "import PIL"` |
 | `curses` (stdlib) | ✅ yes | ships with Python | full-screen TUI; needs a real TTY | — |
 | Terminal | ✅ yes | ≥ 40×8 (code minimum); **80×24 recommended** | below 40×8 the UI prints `terminal too small` and waits | `stty size` |
 
@@ -133,16 +139,19 @@ git clone https://github.com/Narla7/sonic.git
 cd sonic
 ```
 
-### 3. Optional: ID3 tag support
+### 3. Python dependencies
 
 ```sh
-pip install -r requirements.txt        # installs tinytag>=1.10
+pip install -r requirements.txt        # installs tinytag>=1.10, Pillow>=10
 ```
 
-Without this step everything still works — rows show filenames instead of
+`tinytag` is optional — without it, rows show filenames instead of
 `Artist - Title`, durations show `--:--`, and the status bar notes
-`tinytag missing: showing filenames`. If your distro's Python is
-externally-managed (PEP 668) and `pip` refuses, any of these work too:
+`tinytag missing: showing filenames`. `Pillow` is required for album
+art — without it, pressing `a` reports
+`art: install Pillow for album art` and no art is shown. If your
+distro's Python is externally-managed (PEP 668) and `pip` refuses, any
+of these work too:
 
 - System package: `sudo apt install python3-tinytag` (Debian/Ubuntu),
   `python-tinytag` from the AUR (Arch) — or check your distro for a tinytag
@@ -248,6 +257,7 @@ cases.
 | `+` / `=`, `-` / `_` | Volume up / down, 5 % steps (`VOLUME <pct>`), clamped 0–100 |
 | `s` | Shuffle on / off |
 | `r` | Repeat `off → all → one` |
+| `a` | Album art off → picker (choose image, art on) → off |
 | `q` / `Esc` | Quit |
 
 Notes, straight from `handle_key`:
@@ -300,6 +310,14 @@ track — only forward advance repeats — because the guard in `advance` checks
 - **Progress bar.** `#` filled / `-` empty, width `max(10, w-24)`, fraction
   clamped 0–1. Header/list/status/hints are truncated to `w-1` so a
   terminal resize can never throw `curses` errors.
+- **Album art.** Off at startup (`art_on = False`). `a` while off opens a
+  modal picker (`↑↓`/`jk` + `Enter`, `Esc` cancels) over the folder's
+  images (any extension in `IMAGE_EXTS`: jpg/jpeg/jfif/png/webp/bmp/gif/
+  tif/tiff/avif) plus the embedded cover when `tinytag` finds one in the
+  current track's tags. `a` while on just turns it off. Needs `Pillow`;
+  corrupt/unreadable images fall back to `no album art` instead of
+  crashing. The side panel needs ≥ 76×14, else the status bar notes
+  `panel hidden: terminal too small`.
 - **Resize / small terminals.** Below 40×8 the screen shows
   `terminal too small` and keeps polling — resize and it reappears.
 - **Missing/corrupt tags.** `TinyTag.get()` is wrapped in `try/except`; any
@@ -419,6 +437,7 @@ by design. The install is a symlink, and the app writes nothing at runtime.
 | `sonic: error: terminal problem: …` | `curses` failure — run inside a terminal with a valid `TERM` (try `TERM=xterm-256color`); exit `1` |
 | Screen shows `terminal too small` | Terminal smaller than 40×8 — resize; 80×24 is the comfortable floor |
 | Filenames instead of `Artist - Title`, durations `--:--` | `tinytag` not installed → `pip install -r requirements.txt`; status bar says `tinytag missing` |
+| `a` says `art: install Pillow for album art` / `no album art found` | `Pillow` missing → `pip install -r requirements.txt`; or the folder has no images and the track has no embedded cover |
 | No sound but the UI still moves | Audio server issue outside `sonic`: check `alsamixer`/`pavucontrol`, and that `mpg123 somefile.mp3` alone makes noise |
 | Leftover `mpg123 --remote` process | Shouldn't happen (graceful `QUIT` + 2 s `kill` fallback) — `pkill -f 'mpg123 --remote'` cleans up manually |
 | `-V` works but plain `sonic` errors | Run it in a folder containing at least one `.mp3` — that's the whole prereq besides the TTY |
@@ -430,7 +449,7 @@ by design. The install is a symlink, and the app writes nothing at runtime.
 ```sh
 rm ~/.local/bin/sonic                 # remove the symlink
 rm -rf ~/Projects/sonic               # remove the clone (or wherever you put it)
-pip uninstall tinytag                 # only if you want the library gone too
+pip uninstall tinytag Pillow          # only if you want the libraries gone too
 ```
 
 That's everything. `sonic` never writes config files, caches, session

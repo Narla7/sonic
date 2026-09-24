@@ -1,6 +1,5 @@
-"""Unit tests for sonic's pure helpers and new visualizer/art logic."""
+"""Unit tests for sonic's pure helpers and album-art logic."""
 
-import math
 import os
 import sys
 import tempfile
@@ -24,30 +23,6 @@ class FakeEngine:
 
     def set_volume(self, v):
         pass
-
-    def load(self, p):
-        pass
-
-    def pause_toggle(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def seek(self, d):
-        pass
-
-    def poll(self):
-        pass
-
-    def quit(self):
-        pass
-
-
-class FakeAnalyzer:
-    bars = sonic.BARS_MAX
-    levels = [0.0] * sonic.BARS_MAX
-    active = False
 
     def load(self, p):
         pass
@@ -126,55 +101,78 @@ class TestScanArt(unittest.TestCase):
             self.assertEqual(sonic.scan_album_art(d), ["cover.JPG", "poster.png"])
 
 
+class TestArtChoices(unittest.TestCase):
+    def test_folder_only(self):
+        self.assertEqual(
+            sonic.build_art_choices(["b.png", "a.jpg"], False),
+            ["a.jpg", "b.png"])
+
+    def test_embedded_appended(self):
+        self.assertEqual(
+            sonic.build_art_choices(["b.png"], True),
+            ["b.png", sonic.EMBEDDED_CHOICE])
+
+    def test_non_images_filtered(self):
+        self.assertEqual(sonic.build_art_choices(["x.txt"], False), [])
+        self.assertEqual(sonic.build_art_choices(["x.txt"], True),
+                         [sonic.EMBEDDED_CHOICE])
+
+    def test_labels(self):
+        self.assertEqual(sonic.choice_label(sonic.EMBEDDED_CHOICE),
+                         "Embedded cover (from MP3 tags)")
+        self.assertEqual(sonic.choice_label("cover.jpg"), "cover.jpg")
+
+
+class TestCoverArt(unittest.TestCase):
+    def test_manual_file_selection(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "a.jpg"), "w").close()
+            open(os.path.join(d, "b.jpg"), "w").close()
+            cover = sonic.CoverArt(d, ["a.jpg", "b.jpg"])
+            self.assertIsNone(cover.manual)
+            cover.set_manual("b.jpg")
+            cover.set_track(os.path.join(d, "song.mp3"))
+            self.assertEqual(cover.path, os.path.join(d, "b.jpg"))
+
+    def test_manual_cleared_on_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            cover = sonic.CoverArt(d, ["a.jpg"])
+            cover.set_manual("a.jpg")
+            cover.refresh_images([])
+            self.assertIsNone(cover.manual)
+
+
 class TestLayout(unittest.TestCase):
     def test_small_no_panel(self):
-        layout = sonic.compute_layout(12, 70, True, True)
+        layout = sonic.compute_layout(12, 70, True)
         self.assertEqual(layout["panel_w"], 0)
         self.assertEqual(layout["list_w"], 69)
 
     def test_wide_split(self):
-        layout = sonic.compute_layout(24, 120, True, True)
+        layout = sonic.compute_layout(24, 120, True)
         self.assertGreater(layout["panel_w"], 0)
         self.assertGreater(layout["art_h"], 0)
-        self.assertGreater(layout["viz_h"], 0)
-        self.assertEqual(layout["art_h"] + layout["viz_h"], 24 - 5)
 
-    def test_art_only(self):
-        layout = sonic.compute_layout(24, 120, True, False)
-        self.assertGreater(layout["art_h"], 0)
-        self.assertEqual(layout["viz_h"], 0)
-
-
-class TestSpectrum(unittest.TestCase):
-    def test_sine_peaks_near_freq(self):
-        sine = [int(18000 * math.sin(2 * math.pi * 440 * i / 16000))
-                for i in range(1024)]
-        mags = sonic.spectrum_magnitudes(sine, 16000, 12)
-        self.assertGreater(mags[5], mags[0])
-        self.assertGreater(mags[5], mags[11])
-
-    def test_goertzel_matches(self):
-        sine = [int(1000 * math.sin(2 * math.pi * 1000 * i / 16000))
-                for i in range(1024)]
-        self.assertGreater(sonic.goertzel(sine, 1000, 16000),
-                           sonic.goertzel(sine, 7000, 16000))
+    def test_art_off(self):
+        layout = sonic.compute_layout(24, 120, False)
+        self.assertEqual(layout["panel_w"], 0)
+        self.assertEqual(layout["art_h"], 0)
 
 
 class TestUIKeys(unittest.TestCase):
     def _ui(self):
         return sonic.UI(FakeStdscr(), [sonic.Track("a.mp3", "A")],
-                        "/tmp", engine=FakeEngine(), analyzer=FakeAnalyzer())
+                        "/tmp", engine=FakeEngine())
 
-    def test_toggles(self):
+    def test_art_defaults_off(self):
         ui = self._ui()
-        self.assertTrue(ui.art_on)
-        self.assertTrue(ui.viz_on)
-        self.assertTrue(ui.handle_key(ord("a")))
         self.assertFalse(ui.art_on)
+
+    def test_no_viz_key(self):
+        ui = self._ui()
+        # 'v' is unmapped now; state unchanged, loop continues.
         self.assertTrue(ui.handle_key(ord("v")))
-        self.assertFalse(ui.viz_on)
-        self.assertTrue(ui.handle_key(ord("v")))
-        self.assertTrue(ui.viz_on)
+        self.assertFalse(ui.art_on)
 
     def test_quit(self):
         ui = self._ui()
