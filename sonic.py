@@ -409,18 +409,19 @@ class CoverArt:
         return best
 
     def _render(self, cols: int, rows: int, use_color: bool, ncolors: int) -> list | None:
-        """Resample to a cols x (rows*2) pixel buffer, one char per 1x2 block.
+        """Resample to a cols x (rows*CELL_ASPECT) pixel buffer, one char per block.
 
-        Terminal cells are ~twice as tall as wide, so each cell shows two
-        stacked pixels via `▀` (fg=top, bg=bottom): proportions stay correct
-        and vertical resolution doubles vs full-block rendering.
+        Terminal cells are ~CELL_ASPECT times taller than wide, so each cell
+        shows stacked pixels via `▀` (fg=top, bg=bottom): proportions stay
+        correct and vertical resolution doubles vs full-block rendering.
         """
         palette = terminal_palette(ncolors)
+        pix_h = max(1, int(round(rows * CELL_ASPECT)))
         try:
             src = io.BytesIO(self._embedded) if self._embedded is not None else self.path
             img = _PILImage.open(src)
             img = _PILImageOps.exif_transpose(img).convert("RGB")
-            img = _PILImageOps.fit(img, (max(1, cols), max(1, rows * 2)),
+            img = _PILImageOps.fit(img, (max(1, cols), pix_h),
                                    _PILImage.Resampling.LANCZOS)
         except Exception:
             return None
@@ -643,20 +644,37 @@ KEY_HINTS = ("↑↓/jk select · Enter play · Space pause · n/p next/prev · 
 
 REPEAT_LABEL = {"off": "off", "all": "all", "one": "one"}
 
+# Terminal cell proportions: height ≈ 2× width. The art region is sized
+# from this so the cover always displays square, whatever the window is.
+CELL_ASPECT = 2.0
 
-def compute_layout(h: int, w: int, art_on: bool) -> dict:
-    """Pure layout logic; returns panel/list geometry for a terminal size."""
+MIN_LIST_W = 26   # track list never narrower than this (titles stay readable)
+MIN_ART_SIDE = 12  # art square side in cols; smaller isn't worth a panel
+
+
+def compute_layout(h: int, w: int, art_on: bool, need_w: int = 0) -> dict:
+    """Pure layout logic; returns panel/list geometry for a terminal size.
+
+    The art square is as big as possible: bounded by panel height, then by
+    whatever width is left after the track list takes what it needs
+    (`need_w`, capped at half the window so long titles can't kill art).
+    Centered in the panel both ways.
+    """
     layout = {
-        "panel_w": 0, "list_w": max(0, w - 1), "art_h": 0,
+        "panel_w": 0, "list_w": max(0, w - 1),
+        "art_w": 0, "art_h": 0, "art_y": 1,
     }
     if art_on and h >= 14 and w >= 76 and h - 5 >= 7:
-        panel_w = max(24, min(40, w // 3))
-        list_w = w - 1 - panel_w
-        if list_w >= 26:
-            layout["panel_w"] = panel_w
-            layout["list_w"] = list_w
-    if layout["panel_w"]:
-        layout["art_h"] = h - 5
+        avail = h - 5
+        need = max(MIN_LIST_W, min(need_w, w // 2))
+        side = min(avail * 2, w - 1 - need - 3)
+        side -= side % 2  # even width → exact square with art_h below
+        if side >= MIN_ART_SIDE:
+            layout["panel_w"] = side + 3
+            layout["list_w"] = w - 1 - (side + 3)
+            layout["art_w"] = side
+            layout["art_h"] = max(1, int(round(side / CELL_ASPECT)))
+            layout["art_y"] = 1 + (avail - layout["art_h"]) // 2
     return layout
 
 
@@ -740,6 +758,15 @@ class UI:
         else:
             self.step(+1)
 
+    def _need_list_w(self) -> int:
+        """Widest track row, so the list takes only what titles require."""
+        num_w = len(str(len(self.tracks))) if self.tracks else 1
+        widest = 0
+        for i, t in enumerate(self.tracks):
+            dur = format_time(t.duration) if t.duration else "--:--"
+            widest = max(widest, len(f"▶ {i + 1:>{num_w}}. {t.display}  {dur}"))
+        return widest
+
     # -- rendering ------------------------------------------------------
     def draw(self) -> None:
         s = self.stdscr
@@ -754,7 +781,7 @@ class UI:
         header = f" sonic  ·  {self.directory} "
         s.addstr(0, 0, header[:w - 1], curses.A_BOLD | self._color(1))
 
-        layout = compute_layout(h, w, self.art_on)
+        layout = compute_layout(h, w, self.art_on, self._need_list_w())
         list_w = layout["list_w"]
         list_h = h - 5
         panel_w = layout["panel_w"]
@@ -882,19 +909,20 @@ class UI:
         for y in range(1, h - 4):
             s.addstr(y, panel_x, sep, curses.A_DIM)
 
-        art_x = panel_x + 2
-        art_w = max(1, panel_w - 3)
+        art_w = layout["art_w"]
+        art_h = layout["art_h"]
+        art_y = layout["art_y"]
+        art_x = panel_x + (panel_w - art_w) // 2
 
-        if layout["art_h"] and self.art_on:
-            art_y = 1
+        if art_h and self.art_on:
             if self.kitty_art and self.cover.kitty_png() is not None:
                 # Native full-res overlay; keep the cells blank beneath it.
-                for i in range(layout["art_h"]):
+                for i in range(art_h):
                     s.addstr(art_y + i, art_x, " " * art_w)
-                self._sync_kitty((art_y, art_x, art_w, layout["art_h"]))
+                self._sync_kitty((art_y, art_x, art_w, art_h))
                 return
             self._sync_kitty(None)
-            cells = self.cover.render(art_w, layout["art_h"], use_color, ncolors)
+            cells = self.cover.render(art_w, art_h, use_color, ncolors)
             if cells is None:
                 if not self.cover.available:
                     msg = "install Pillow for art"
@@ -904,7 +932,7 @@ class UI:
                     msg = "no album art"
                 s.addstr(art_y, art_x, msg[:art_w], curses.A_DIM)
             else:
-                for i, row in enumerate(cells[:layout["art_h"]]):
+                for i, row in enumerate(cells[:art_h]):
                     _draw_run(s, art_y + i, art_x, row, self._resolve_pair)
 
     def _resolve_pair(self, key: tuple) -> int:
@@ -1038,7 +1066,10 @@ class UI:
             self.engine.poll()
             if self.engine.ended:
                 self.on_track_end()
-            self.draw()
+            try:
+                self.draw()
+            except curses.error:
+                pass  # resize race mid-frame: next tick repaints cleanly
             try:
                 key = s.getch()
             except curses.error:
@@ -1051,6 +1082,15 @@ class UI:
 
     def handle_key(self, key: int) -> bool:
         """Returns False when the app should quit."""
+        if key == curses.KEY_RESIZE:
+            # Fresh geometry is picked up by the next draw(); clear any
+            # stale curses optimizations. Kitty overlay re-places itself
+            # via _sync_kitty when the geometry changes.
+            try:
+                self.stdscr.clear()
+            except curses.error:
+                pass
+            return True
         if key in (curses.KEY_UP, ord("k")):
             self.cursor = max(0, self.cursor - 1)
         elif key in (curses.KEY_DOWN, ord("j")):

@@ -66,7 +66,12 @@ cd ~/Music && sonic
   `Enter` selects, `Esc` cancels. The file choice sticks for the session,
   the embedded choice reloads per track. Requires `Pillow`. Inside Kitty
   the image renders full-resolution via the Kitty graphics protocol;
-  other terminals get half-block (`▀`) rendering.
+  other terminals get half-block (`▀`) rendering. The art box is always
+  square and as big as possible: it claims every column the track list
+  doesn't need for full titles (list never narrower than 26, titles never
+  force it past half the window), sized from height, centered. Resizing
+  the terminal repaints live (`KEY_RESIZE` clears stale output, a mid-frame
+  resize just skips that frame).
 - 🎨 **Color** — cyan header, green now-playing row, yellow progress bar when
   the terminal supports color (degraded to bold/dim otherwise).
 

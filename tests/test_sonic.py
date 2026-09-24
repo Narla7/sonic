@@ -245,6 +245,46 @@ class TestLayout(unittest.TestCase):
         self.assertEqual(layout["panel_w"], 0)
         self.assertEqual(layout["art_h"], 0)
 
+    def test_art_always_square(self):
+        # Displayed proportions must be square at any window size:
+        # width == height-in-rows * cell aspect.
+        for h, w in [(24, 80), (24, 120), (40, 120), (50, 200),
+                     (14, 76), (14, 200), (30, 90)]:
+            layout = sonic.compute_layout(h, w, True)
+            self.assertGreater(layout["panel_w"], 0)
+            self.assertEqual(layout["art_w"],
+                             layout["art_h"] * sonic.CELL_ASPECT)
+
+    def test_art_centered_when_tall(self):
+        # Width-capped square on a tall window: centered vertically.
+        layout = sonic.compute_layout(50, 90, True)
+        avail = 50 - 5
+        self.assertEqual(layout["art_y"], 1 + (avail - layout["art_h"]) // 2)
+        self.assertGreater(layout["art_y"], 1)
+
+    def test_art_maximal_on_tall_window(self):
+        # Tall + wide: art claims everything the list doesn't need.
+        layout = sonic.compute_layout(40, 120, True, need_w=45)
+        self.assertEqual((layout["art_w"], layout["art_h"]), (70, 35))
+        self.assertGreaterEqual(layout["list_w"], 45)
+
+    def test_list_keeps_title_width(self):
+        layout = sonic.compute_layout(30, 100, True, need_w=70)
+        self.assertGreaterEqual(layout["list_w"], 50)  # need capped at w/2
+        self.assertGreater(layout["art_w"], 0)
+
+    def test_huge_need_capped_at_half(self):
+        # Absurdly long titles can't kill the art panel.
+        layout = sonic.compute_layout(24, 120, True, need_w=500)
+        self.assertGreater(layout["panel_w"], 0)
+        self.assertGreater(layout["art_w"], 0)
+        self.assertEqual(layout["art_w"], layout["art_h"] * sonic.CELL_ASPECT)
+
+    def test_art_shrinks_when_short(self):
+        layout = sonic.compute_layout(14, 200, True)
+        self.assertLessEqual(layout["art_h"], 14 - 5)
+        self.assertEqual(layout["art_w"], layout["art_h"] * sonic.CELL_ASPECT)
+
 
 class TestUIKeys(unittest.TestCase):
     def _ui(self):
@@ -260,6 +300,30 @@ class TestUIKeys(unittest.TestCase):
         # 'v' is unmapped now; state unchanged, loop continues.
         self.assertTrue(ui.handle_key(ord("v")))
         self.assertFalse(ui.art_on)
+
+    def test_resize_key(self):
+        import curses
+        ui = self._ui()
+
+        class Scr:
+            cleared = False
+
+            def clear(self):
+                self.cleared = True
+
+        ui.stdscr = Scr()
+        self.assertTrue(ui.handle_key(curses.KEY_RESIZE))
+        self.assertTrue(ui.stdscr.cleared)
+
+    def test_need_list_w(self):
+        ui = sonic.UI(FakeStdscr(),
+                      [sonic.Track("a.mp3", "A Very Long Title Here", "B"),
+                       sonic.Track("b.mp3", "C")],
+                      "/tmp", engine=FakeEngine())
+        need = ui._need_list_w()
+        self.assertGreaterEqual(need, len("B - A Very Long Title Here"))
+        layout = sonic.compute_layout(24, 200, True, need)
+        self.assertGreaterEqual(layout["list_w"], need)
 
     def test_quit(self):
         ui = self._ui()
