@@ -120,6 +120,55 @@ def progress_bar(frac: float, width: int) -> str:
 
 EMBEDDED_CHOICE = "__embedded__"
 
+# --------------------------------------------------------------------------
+# Kitty native images (hi-res album art)
+# --------------------------------------------------------------------------
+
+KITTY_CHUNK = 4096  # max base64 payload bytes per escape sequence
+KITTY_MAX_SIDE = 768  # transmit bound; the terminal scales to the panel
+
+
+def is_kitty(env=None) -> bool:
+    """True when running inside Kitty (graphics protocol likely supported)."""
+    e = env if env is not None else os.environ
+    term = e.get("TERM", "")
+    return ("kitty" in term or "KITTY_WINDOW_ID" in e
+            or e.get("TERM_PROGRAM") == "kitty")
+
+
+def kitty_transmit_cmds(img_id: int, png: bytes) -> list:
+    """Escape sequences transmitting PNG bytes under `img_id` (no display).
+
+    `q=2` silences terminal replies so curses input stays clean.
+    Pure helper: byte-exact and unit-tested.
+    """
+    import base64
+    b64 = base64.b64encode(png)
+    cmds = []
+    for i in range(0, len(b64), KITTY_CHUNK):
+        chunk = b64[i:i + KITTY_CHUNK]
+        last = i + KITTY_CHUNK >= len(b64)
+        head = f"\x1b_Ga=t,i={img_id},f=100,q=2,m={0 if last else 1};".encode()
+        cmds.append(head + chunk + b"\x1b\\")
+    return cmds
+
+
+def kitty_place_cmd(img_id: int, cols: int, rows: int) -> bytes:
+    """Display transmitted image `img_id` at the cursor, scaled to cells."""
+    return f"\x1b_Ga=p,i={img_id},c={cols},r={rows},q=2\x1b\\".encode()
+
+
+def kitty_delete_cmd(img_id: int) -> bytes:
+    return f"\x1b_Ga=d,d=i,i={img_id},q=2\x1b\\".encode()
+
+
+KITTY_DELETE_ALL = b"\x1b_Ga=d,d=a,q=2\x1b\\"
+
+
+def kitty_cup_cmd(y: int, x: int) -> bytes:
+    """1-based cursor positioning (curses coords are 0-based)."""
+    return f"\x1b[{y + 1};{x + 1}H".encode()
+
 def scan_album_art(directory: str) -> list:
     """Image files directly inside `directory`, ignoring subfolders."""
     try:
@@ -269,12 +318,20 @@ class CoverArt:
         self._embedded: bytes | None = None
         self._cache: dict = {}
         self.available = bool(HAVE_PIL)
+        # Kitty native-image state (ids assigned by the UI).
+        self.kitty_id: int | None = None
+        self._kitty_png: bytes | None = None
+
+    def _invalidate_kitty(self) -> None:
+        self.kitty_id = None
+        self._kitty_png = None
 
     def set_manual(self, choice: str | None) -> None:
         self.manual = choice
         self.path = None
         self._embedded = None
         self._cache.clear()
+        self._invalidate_kitty()
 
     def refresh_images(self, image_names: list) -> None:
         self.image_names = list(image_names)
@@ -286,6 +343,7 @@ class CoverArt:
             data = get_embedded_image(track_path)
             if data != self._embedded:
                 self._cache.clear()
+                self._invalidate_kitty()
             self._embedded = data
             self.path = None
             return
@@ -293,6 +351,7 @@ class CoverArt:
             path = os.path.join(self.directory, self.manual)
             if path != self.path:
                 self._cache.clear()
+                self._invalidate_kitty()
             self.path = path if os.path.isfile(path) else None
             self._embedded = None
             return
@@ -302,8 +361,32 @@ class CoverArt:
         path = os.path.join(self.directory, name) if name else None
         if path != self.path:
             self._cache.clear()
+            self._invalidate_kitty()
         self.path = path
         self._embedded = None
+
+    def kitty_png(self, max_side: int = KITTY_MAX_SIDE) -> bytes | None:
+        """PNG bytes of the current selection/track for Kitty transmit.
+
+        Cached per content; cleared by set_track/set_manual on change.
+        """
+        if not self.available:
+            return None
+        if self._kitty_png is not None:
+            return self._kitty_png
+        try:
+            src = io.BytesIO(self._embedded) if self._embedded is not None else self.path
+            if src is None:
+                return None
+            img = _PILImage.open(src)
+            img = _PILImageOps.exif_transpose(img).convert("RGB")
+            img.thumbnail((max_side, max_side), _PILImage.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            self._kitty_png = buf.getvalue()
+        except Exception:
+            return None
+        return self._kitty_png
 
     def render(self, cols: int, rows: int, use_color: bool, ncolors: int):
         """Return rows of (color_index|None, char) cells, or None if no art."""
@@ -326,36 +409,37 @@ class CoverArt:
         return best
 
     def _render(self, cols: int, rows: int, use_color: bool, ncolors: int) -> list | None:
+        """Resample to a cols x (rows*2) pixel buffer, one char per 1x2 block.
+
+        Terminal cells are ~twice as tall as wide, so each cell shows two
+        stacked pixels via `▀` (fg=top, bg=bottom): proportions stay correct
+        and vertical resolution doubles vs full-block rendering.
+        """
         palette = terminal_palette(ncolors)
         try:
-            if self._embedded is not None:
-                img = _PILImage.open(io.BytesIO(self._embedded))
-            else:
-                img = _PILImage.open(self.path)
+            src = io.BytesIO(self._embedded) if self._embedded is not None else self.path
+            img = _PILImage.open(src)
             img = _PILImageOps.exif_transpose(img).convert("RGB")
-            img.thumbnail((max(1, cols), max(1, rows)), _PILImage.Resampling.LANCZOS)
+            img = _PILImageOps.fit(img, (max(1, cols), max(1, rows * 2)),
+                                   _PILImage.Resampling.LANCZOS)
         except Exception:
             return None
-        w, h = img.size
         px = img.load()
-        offx, offy = (cols - w) // 2, (rows - h) // 2
         grid = []
         for y in range(rows):
             row_cells = []
             for x in range(cols):
-                if offx <= x < offx + w and offy <= y < offy + h:
-                    r, g, b = px[x - offx, y - offy]
-                    if use_color:
-                        idx = self._nearest((r, g, b), palette)
-                        char = "█"
-                    else:
-                        lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
-                        idx = None
-                        char = _ASCII_RAMP[min(len(_ASCII_RAMP) - 1,
-                                             int(lum * len(_ASCII_RAMP)))]
+                r1, g1, b1 = px[x, y * 2]
+                r2, g2, b2 = px[x, y * 2 + 1]
+                if use_color:
+                    fg = self._nearest((r1, g1, b1), palette)
+                    bg = self._nearest((r2, g2, b2), palette)
+                    row_cells.append((fg, bg, "▀"))
                 else:
-                    idx, char = None, " "
-                row_cells.append((idx, char))
+                    lum = (0.299 * (r1 + r2) / 2 + 0.587 * (g1 + g2) / 2
+                           + 0.114 * (b1 + b2) / 2) / 255
+                    row_cells.append((None, None, _ASCII_RAMP[min(len(_ASCII_RAMP) - 1,
+                                                                  int(lum * len(_ASCII_RAMP)))]))
             grid.append(row_cells)
         return grid
 
@@ -576,18 +660,22 @@ def compute_layout(h: int, w: int, art_on: bool) -> dict:
     return layout
 
 
-def _draw_run(s, y, x, cells, color_pairs) -> int:
-    """Draw a row of (color_index|None, char) cells at (y, x)."""
+def _draw_run(s, y, x, cells, resolve) -> int:
+    """Draw a row of (fg|None, bg|None, char) cells at (y, x).
+
+    `resolve((fg, bg))` maps a color key to a curses attribute (0 = plain).
+    """
     i = 0
     n = len(cells)
     while i < n:
-        col, ch = cells[i]
+        fg, bg, _ch = cells[i]
         j = i + 1
-        while j < n and cells[j][0] == col:
+        while j < n and cells[j][0] == fg and cells[j][1] == bg:
             j += 1
-        text = "".join(c[1] for c in cells[i:j])
-        if col is not None:
-            s.addstr(y, x + i, text, color_pairs[col])
+        text = "".join(c[2] for c in cells[i:j])
+        attr = resolve((fg, bg)) if fg is not None or bg is not None else 0
+        if attr:
+            s.addstr(y, x + i, text, attr)
         else:
             s.addstr(y, x + i, text)
         i = j
@@ -610,6 +698,12 @@ class UI:
         self.images = scan_album_art(directory)
         self.cover = CoverArt(directory, self.images)
         self.message = "" if HAVE_TINYTAG else "tinytag missing: showing filenames"
+        # Kitty native hi-res art (falls back to half-blocks elsewhere).
+        self.kitty_art = bool(HAVE_PIL and is_kitty())
+        self._kitty_next_id = 1
+        self._kitty_placed: tuple | None = None  # (img_id, y, x, c, r)
+        self._kitty_pending: list = []
+        self._kitty_used = False
         self.engine.set_volume(self.volume)
 
     # -- playback actions ----------------------------------------------
@@ -685,6 +779,8 @@ class UI:
 
         if panel_w:
             self._draw_panel(h, w, layout, use_color)
+        elif self.kitty_art:
+            self._sync_kitty(None)  # panel hidden/art off: remove overlay
 
         if self.playing is not None:
             t = self.tracks[self.playing]
@@ -713,6 +809,57 @@ class UI:
         s.addstr(h - 2, 0, status[:w - 1], curses.A_DIM)
         s.addstr(h - 1, 0, KEY_HINTS[:w - 1], curses.A_DIM)
         s.refresh()
+        self._flush_kitty()
+
+    def _flush_kitty(self) -> None:
+        """Write queued Kitty escapes after refresh (raw, post-curses)."""
+        if not self._kitty_pending:
+            return
+        try:
+            fd = sys.stdout.fileno()
+            for seq in self._kitty_pending:
+                os.write(fd, seq)
+        except (OSError, ValueError):
+            # Terminal choked: drop back to half-block rendering.
+            self.kitty_art = False
+            if self._kitty_placed is not None:
+                self._kitty_placed = None
+        finally:
+            self._kitty_pending = []
+
+    def _sync_kitty(self, geom: tuple | None) -> None:
+        """Reconcile the Kitty overlay with the desired art geometry.
+
+        `geom` is (y, x, cols, rows) or None when no art should show.
+        Transmits once per content (cached id), re-places on move/resize,
+        deletes the old image when hidden or replaced. Queues escapes for
+        _flush_kitty; pure state machine apart from cover.kitty_png().
+        """
+        if not self.kitty_art:
+            return
+        png = self.cover.kitty_png() if geom is not None else None
+        if png is None:
+            if self._kitty_placed is not None:
+                self._kitty_pending.append(kitty_delete_cmd(self._kitty_placed[0]))
+                self._kitty_placed = None
+            return
+        if self.cover.kitty_id is None:
+            self.cover.kitty_id = self._kitty_next_id
+            self._kitty_next_id += 1
+            self._kitty_pending.extend(kitty_transmit_cmds(self.cover.kitty_id, png))
+            self._kitty_used = True
+        y, x, c, r = geom
+        want = (self.cover.kitty_id, y, x, c, r)
+        if self._kitty_placed is None or self._kitty_placed[0] != self.cover.kitty_id:
+            if self._kitty_placed is not None:
+                self._kitty_pending.append(kitty_delete_cmd(self._kitty_placed[0]))
+            self._kitty_pending.append(kitty_cup_cmd(y, x))
+            self._kitty_pending.append(kitty_place_cmd(self.cover.kitty_id, c, r))
+            self._kitty_placed = want
+        elif self._kitty_placed != want:
+            self._kitty_pending.append(kitty_cup_cmd(y, x))
+            self._kitty_pending.append(kitty_place_cmd(self.cover.kitty_id, c, r))
+            self._kitty_placed = want
 
     def _cover_label(self) -> str:
         if not self.art_on:
@@ -722,7 +869,8 @@ class UI:
         if self.cover.manual == EMBEDDED_CHOICE:
             return "[◉ embedded cover]" if self.cover._embedded is not None else "[no embedded cover]"
         if self.cover.path:
-            return f"[◉ {os.path.basename(self.cover.path)}]"
+            base = f"[◉ {os.path.basename(self.cover.path)}]"
+            return base[:-1] + " hi-res]" if self.kitty_art else base
         return "[no cover]"
 
     def _draw_panel(self, h: int, w: int, layout: dict, use_color: bool) -> None:
@@ -739,6 +887,13 @@ class UI:
 
         if layout["art_h"] and self.art_on:
             art_y = 1
+            if self.kitty_art and self.cover.kitty_png() is not None:
+                # Native full-res overlay; keep the cells blank beneath it.
+                for i in range(layout["art_h"]):
+                    s.addstr(art_y + i, art_x, " " * art_w)
+                self._sync_kitty((art_y, art_x, art_w, layout["art_h"]))
+                return
+            self._sync_kitty(None)
             cells = self.cover.render(art_w, layout["art_h"], use_color, ncolors)
             if cells is None:
                 if not self.cover.available:
@@ -749,19 +904,34 @@ class UI:
                     msg = "no album art"
                 s.addstr(art_y, art_x, msg[:art_w], curses.A_DIM)
             else:
-                pair_map = {}
-                if use_color:
-                    pair_map = self._palette_pairs(ncolors)
                 for i, row in enumerate(cells[:layout["art_h"]]):
-                    _draw_run(s, art_y + i, art_x, row, pair_map)
+                    _draw_run(s, art_y + i, art_x, row, self._resolve_pair)
 
-    def _palette_pairs(self, ncolors: int) -> dict:
-        if not hasattr(self, "__palette"):
-            self.__palette = {}
-            for idx, _ in terminal_palette(ncolors):
-                if idx not in self.__palette:
-                    self.__palette[idx] = curses.color_pair(idx + 1)
-        return self.__palette
+    def _resolve_pair(self, key: tuple) -> int:
+        """Map an (fg, bg) color key to a curses attr, allocating lazily.
+
+        Pairs 1-4 are reserved for UI chrome; art pairs start at 10 so the
+        16-color palette can never clobber them. When the terminal runs out
+        of pairs, reuse any pair with the same fg, else draw plain.
+        """
+        fg, bg = key
+        if not hasattr(self, "_pair_cache"):
+            self._pair_cache = {}
+        if key in self._pair_cache:
+            return self._pair_cache[key]
+        n = 10 + len(self._pair_cache)
+        if n < curses.COLOR_PAIRS:
+            try:
+                curses.init_pair(n, fg if fg is not None else -1,
+                                 bg if bg is not None else -1)
+            except curses.error:
+                return 0
+            self._pair_cache[key] = curses.color_pair(n)
+            return self._pair_cache[key]
+        for (f, _b), attr in self._pair_cache.items():
+            if f == fg:
+                return attr
+        return 0
 
     def _color(self, n: int) -> int:
         return curses.color_pair(n) if curses.has_colors() else curses.A_NORMAL
@@ -862,11 +1032,8 @@ class UI:
             curses.init_pair(2, curses.COLOR_GREEN, -1)
             curses.init_pair(3, curses.COLOR_YELLOW, -1)
             curses.init_pair(4, curses.COLOR_RED, -1)
-            for idx, _ in terminal_palette(curses.COLORS):
-                try:
-                    curses.init_pair(idx + 1, idx, -1)
-                except curses.error:
-                    break
+            # Art color pairs allocate lazily in _resolve_pair (from 10 up),
+            # so the UI pairs above are never clobbered.
         while True:
             self.engine.poll()
             if self.engine.ended:
@@ -932,6 +1099,11 @@ def run_ui(stdscr, tracks: list, directory: str) -> None:
         ui.run()
     finally:
         ui.engine.quit()
+        if ui._kitty_used:
+            try:
+                os.write(sys.stdout.fileno(), KITTY_DELETE_ALL)
+            except (OSError, ValueError):
+                pass
 
 
 # --------------------------------------------------------------------------

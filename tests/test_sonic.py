@@ -141,6 +141,93 @@ class TestCoverArt(unittest.TestCase):
             cover.refresh_images([])
             self.assertIsNone(cover.manual)
 
+    @unittest.skipUnless(sonic.HAVE_PIL, "Pillow required")
+    def test_render_fills_panel_half_blocks(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            Image.new("RGB", (100, 100), (200, 100, 50)).save(
+                os.path.join(d, "art.jpg"))
+            cover = sonic.CoverArt(d, ["art.jpg"])
+            cover.set_manual("art.jpg")
+            cover.set_track(os.path.join(d, "song.mp3"))
+            cols, rows = 30, 12
+            grid = cover.render(cols, rows, True, 256)
+            self.assertEqual(len(grid), rows)
+            for row in grid:
+                self.assertEqual(len(row), cols)
+                for fg, bg, ch in row:
+                    self.assertEqual(ch, "▀")
+                    self.assertIsInstance(fg, int)
+                    self.assertIsInstance(bg, int)
+
+    @unittest.skipUnless(sonic.HAVE_PIL, "Pillow required")
+    def test_render_mono_ascii(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            Image.new("RGB", (50, 50), (255, 255, 255)).save(
+                os.path.join(d, "art.png"))
+            cover = sonic.CoverArt(d, ["art.png"])
+            cover.set_manual("art.png")
+            cover.set_track(os.path.join(d, "song.mp3"))
+            grid = cover.render(20, 8, False, 0)
+            self.assertEqual(len(grid), 8)
+            chars = {ch for row in grid for _, _, ch in row}
+            self.assertTrue(chars <= set(sonic._ASCII_RAMP))
+
+
+class TestKitty(unittest.TestCase):
+    def test_is_kitty(self):
+        self.assertTrue(sonic.is_kitty({"TERM": "xterm-kitty"}))
+        self.assertTrue(sonic.is_kitty({"TERM": "x",
+                                        "KITTY_WINDOW_ID": "1"}))
+        self.assertFalse(sonic.is_kitty({"TERM": "xterm-256color"}))
+
+    def test_transmit_roundtrip(self):
+        import base64
+        png = b"\x89PNG\r\n" + bytes(9000)
+        cmds = sonic.kitty_transmit_cmds(7, png)
+        self.assertGreater(len(cmds), 1)
+        self.assertTrue(cmds[0].startswith(b"\x1b_Ga=t,i=7,f=100,q=2,m=1;"))
+        self.assertTrue(cmds[-1].startswith(b"\x1b_Ga=t,i=7,f=100,q=2,m=0;"))
+        payload = b"".join(c.split(b";", 1)[1][:-2] for c in cmds)
+        self.assertEqual(payload, base64.b64encode(png))
+        for c in cmds:
+            self.assertEqual(len(c.split(b";", 1)[1][:-2]), 4096
+                             if c is not cmds[-1] else len(payload) % 4096 or 4096)
+
+    def test_place_delete_cup(self):
+        self.assertEqual(sonic.kitty_place_cmd(7, 37, 19),
+                         b"\x1b_Ga=p,i=7,c=37,r=19,q=2\x1b\\")
+        self.assertEqual(sonic.kitty_delete_cmd(7),
+                         b"\x1b_Ga=d,d=i,i=7,q=2\x1b\\")
+        self.assertEqual(sonic.kitty_cup_cmd(1, 42), b"\x1b[2;43H")
+
+    @unittest.skipUnless(sonic.HAVE_PIL, "Pillow required")
+    def test_kitty_png_and_sync(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as d:
+            Image.new("RGB", (100, 100), (10, 20, 30)).save(
+                os.path.join(d, "art.jpg"))
+            ui = sonic.UI(FakeStdscr(), [sonic.Track("a.mp3", "A")],
+                          d, engine=FakeEngine())
+            ui.kitty_art = True  # force: headless TERM may vary
+            ui.cover.set_manual("art.jpg")
+            ui.cover.set_track(os.path.join(d, "song.mp3"))
+            png = ui.cover.kitty_png()
+            self.assertTrue(png.startswith(b"\x89PNG"))
+            ui._sync_kitty((1, 40, 30, 10))
+            self.assertGreaterEqual(len(ui._kitty_pending), 3)
+            self.assertEqual(ui._kitty_placed, (1, 1, 40, 30, 10))
+            ui._kitty_pending = []
+            ui._sync_kitty((1, 40, 30, 10))
+            self.assertEqual(ui._kitty_pending, [])  # quiet when unchanged
+            ui._sync_kitty((1, 40, 30, 9))
+            self.assertEqual(len(ui._kitty_pending), 2)  # re-place only
+            ui._kitty_pending = []
+            ui._sync_kitty(None)
+            self.assertEqual(len(ui._kitty_pending), 1)  # delete on hide
+            self.assertIsNone(ui._kitty_placed)
+
 
 class TestLayout(unittest.TestCase):
     def test_small_no_panel(self):

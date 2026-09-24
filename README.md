@@ -64,7 +64,9 @@ cd ~/Music && sonic
   startup. Press `a` to open a picker listing every image in the folder
   plus `Embedded cover (from MP3 tags)` when the current track has one;
   `Enter` selects, `Esc` cancels. The file choice sticks for the session,
-  the embedded choice reloads per track. Requires `Pillow`.
+  the embedded choice reloads per track. Requires `Pillow`. Inside Kitty
+  the image renders full-resolution via the Kitty graphics protocol;
+  other terminals get half-block (`▀`) rendering.
 - 🎨 **Color** — cyan header, green now-playing row, yellow progress bar when
   the terminal supports color (degraded to bold/dim otherwise).
 
