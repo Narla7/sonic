@@ -1,1 +1,2 @@
 tinytag>=1.10
+Pillow>=10  # optional but required for album-art display
